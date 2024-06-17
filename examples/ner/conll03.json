@@ -1,0 +1,17 @@
+{
+    "max_len": 256,
+    "dataset_name": "conll2003",
+    "ae_epochs": 20,
+    "ae_latent_dim": 2048,
+    "epochs": 30,
+    "batch_size": 64,
+    "learning_rate": 0.00001,
+    "pretrained_model_dir": "/home/jupyter-sean/workspace/BERT-Pretrained-Models/cased_L-12_H-768_A-12",
+    "save_dir": "ckpts/conll03",
+    "dropout_rate": 0.5,
+    "valve_rate": 0.4,
+    "use_dynamic_valve": false,
+    "optimizer": "adamw",
+    "iterations": 1,
+    "verbose": 1
+}

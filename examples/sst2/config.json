@@ -1,0 +1,16 @@
+{
+    "max_len": 128,
+    "ae_epochs": 1,
+    "ae_latent_dim": 1024,
+    "epochs": 10,
+    "batch_size": 64,
+    "learning_rate": 0.00002,
+    "pretrained_model_dir": "pretrained-bert-hf",
+    "train_path": "examples/sst2/train.jsonl",
+    "dev_path": "examples/sst2/dev.jsonl",
+    "save_dir": "ckpts/sst2",
+    "hidden_size": 256,
+    "dropout_rate": 0.1,
+    "iterations": 1,
+    "verbose": 1
+}
