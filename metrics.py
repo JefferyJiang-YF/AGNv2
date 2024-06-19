@@ -3,13 +3,14 @@ from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score
-
 from collections import defaultdict
-from seqeval.metrics import f1_score as ner_f1_score, classification_report as ner_classification_report
+
+from sklearn.metrics import classification_report, f1_score
+from itertools import chain
 
 
 class ClfMetrics(torch.nn.Module):
-    def __init__(self, model, batch_size, eval_data, save_path, min_delta=1e-4, patience=10):
+    def __init__(self, model, eval_loader, save_path, min_delta=1e-4, patience=10):
         super(ClfMetrics, self).__init__()
 
         self.model = model
@@ -17,10 +18,10 @@ class ClfMetrics(torch.nn.Module):
         self.min_delta = min_delta
         self.monitor_op = np.greater
         self.save_path = save_path
-        self.batch_size = batch_size
-        self.eval_data = DataLoader(eval_data, batch_size=self.batch_size, shuffle=False)
+        self.eval_data = eval_loader  # 直接使用传入的 DataLoader
         self.history = defaultdict(list)
         self.stop_training = False  # 添加标志以支持早停
+        self.best = -np.Inf
 
     def on_train_begin(self):
         self.step = 0
@@ -32,19 +33,23 @@ class ClfMetrics(torch.nn.Module):
         self.model.eval()
         y_true, y_pred = [], []
         with torch.no_grad():
-            for chunk in self.eval_data:
-                token_ids = pad_sequence([obj['token_ids'] for obj in chunk], batch_first=True, padding_value=0)
-                segment_ids = pad_sequence([obj['segment_ids'] for obj in chunk], batch_first=True, padding_value=0)
-                tfidf_vectors = torch.stack([obj['tfidf_vector'] for obj in chunk])
-                true_labels = torch.tensor([obj['label_id'] for obj in chunk])
+            for token_ids, segment_ids, tfidf_vectors, true_labels in self.eval_data:  # 直接解包每个批次的数据
 
-                pred = self.model(token_ids, segment_ids, tfidf_vectors)
-                pred = torch.argmax(pred, dim=1)
+                # print("Processing a new chunk...")  # 打印开始处理新的数据块
+
+                # 直接使用解包后的数据，不需要额外处理
+                preds, attn_weights = self.model(token_ids, segment_ids, tfidf_vectors)
+
+                pred = torch.argmax(preds, dim=1)
                 y_true.extend(true_labels.tolist())
                 y_pred.extend(pred.tolist())
 
+                # print("Batch size after processing:", token_ids.size(0))
+
         acc = accuracy_score(y_true, y_pred)
         f1 = f1_score(y_true, y_pred, average="macro")
+        print("Calculated Accuracy:", acc)
+        print("Calculated F1 Score:", f1)
         return f1, acc
 
     def on_epoch_end(self, epoch):
@@ -69,57 +74,54 @@ class ClfMetrics(torch.nn.Module):
         if self.stopped_epoch > 0:
             print(f'Epoch {self.stopped_epoch + 1:05d}: early stopping.')
 
+    def should_stop(self):
+        return self.stop_training
+
+    def max_accuracy(self):
+        return max(self.history['val_acc'], default=0)
+
+    def max_f1(self):
+        return max(self.history['val_f1'], default=0)
+
 
 class NERMetrics(torch.nn.Module):
-    def __init__(self, model, batch_size, eval_data, save_path, min_delta=1e-4, patience=10):
+    def __init__(self, model, eval_loader, save_path, min_delta=1e-4, patience=10):
         super(NERMetrics, self).__init__()
         self.model = model
+        self.eval_loader = eval_loader
         self.save_path = save_path
-        self.batch_size = batch_size
-        self.eval_data = DataLoader(eval_data, batch_size=self.batch_size, shuffle=False)
         self.patience = patience
         self.min_delta = min_delta
         self.monitor_op = np.greater
+        self.best = -np.Inf
+        self.stop_training = False
+
         self.history = defaultdict(list)
-        self.stop_training = False  # 添加标志以支持早停
 
     def on_train_begin(self):
-        self.step = 0
         self.wait = 0
         self.stopped_epoch = 0
-        self.best = -np.Inf
-
-    def decode(self, tag_ids):
-        """Decodes tag indexes to formatted tags."""
-        tag_vocab = {0: 'O', 1: 'B-PER', 2: 'I-PER', 3: 'B-LOC', 4: 'I-LOC', 5: 'B-ORG',
-                     6: 'I-ORG'}  # Example tag mapping
-        tags = [tag_vocab.get(tag_id, 'O') for tag_id in tag_ids]
-        return tags
 
     def calc_metrics(self):
         self.model.eval()
         y_true, y_pred = [], []
         with torch.no_grad():
-            for chunk in self.eval_data:
-                inputs = {key: pad_sequence([obj[key] for obj in chunk], batch_first=True, padding_value=0) for key in
-                          ['token_ids', 'segment_ids']}
-                labels = [obj['label_ids'] for obj in chunk]
+            for data in self.eval_loader:
+                token_ids, segment_ids, tfidf_vectors, true_labels = data
+                emissions = self.model(token_ids, segment_ids, tfidf_vectors)
+                preds = self.model.crf.decode(emissions)  # Using CRF to decode
+                for i, length in enumerate((token_ids != 0).sum(1)):
+                    y_true.extend(true_labels[i][:length].tolist())
+                    y_pred.extend(preds[i][:length])  # preds are already decoded using CRF
 
-                outputs = self.model(**inputs)
-                predictions = torch.argmax(outputs, dim=-1)
-
-                y_true.extend([self.decode(label) for label in labels])
-                y_pred.extend([self.decode(prediction) for prediction in predictions])
-
-        print(ner_classification_report(y_true, y_pred))
-        f1 = ner_f1_score(y_true, y_pred)
+        print(classification_report(list(chain(*y_true)), list(chain(*y_pred))))
+        f1 = f1_score(list(chain(*y_true)), list(chain(*y_pred)), average="micro")
         return f1
 
     def on_epoch_end(self, epoch):
         val_f1 = self.calc_metrics()
         self.history['val_f1'].append(val_f1)
         print(f"- val_f1: {val_f1}")
-
         if self.monitor_op(val_f1 - self.min_delta, self.best):
             self.best = val_f1
             self.wait = 0
@@ -129,9 +131,13 @@ class NERMetrics(torch.nn.Module):
             self.wait += 1
             if self.wait >= self.patience:
                 self.stopped_epoch = epoch
-                self.stop_training = True  # 设置停止训练标志
+                self.stop_training = True
                 print('Early stopping triggered.')
 
     def on_train_end(self):
         if self.stopped_epoch > 0:
             print(f'Epoch {self.stopped_epoch + 1:05d}: early stopping.')
+
+    def should_stop(self):
+        return self.stop_training
+

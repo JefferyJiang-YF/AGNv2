@@ -1,4 +1,5 @@
 import torch
+
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -7,9 +8,13 @@ from sklearn.model_selection import train_test_split
 from torch.nn import LayerNorm, Dropout
 from transformers import BertModel, BertConfig
 
+from torchcrf import CRF
+
+
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
+
 
 def sequence_masking(x, mask=None, value='-inf', axis=None):
     """Mask sequence.
@@ -61,9 +66,6 @@ def sequence_masking(x, mask=None, value='-inf', axis=None):
     return masked_x
 
 
-
-
-
 class WithVAELoss(nn.Module):
     def forward(self, inputs):
         z_mean, z_log_var, y_true, y_pred = inputs
@@ -83,6 +85,7 @@ class WithVAELoss(nn.Module):
 
 class Sampling(nn.Module):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
+
     def __init__(self):
         super(Sampling, self).__init__()
 
@@ -92,12 +95,13 @@ class Sampling(nn.Module):
 
 
 class VariationalAutoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim=64, hidden_dim=128, epochs=1, batch_size=64):
+    def __init__(self, input_dim, latent_dim=64, hidden_dim=128, batch_size=64):
         super(VariationalAutoencoder, self).__init__()
+
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-        self.epochs = epochs
         self.batch_size = batch_size
+
         # Encoder
         self.encoder_hidden = nn.Linear(input_dim, hidden_dim)
         self.z_mean = nn.Linear(hidden_dim, latent_dim)
@@ -120,15 +124,14 @@ class VariationalAutoencoder(nn.Module):
         # Now return all necessary components for loss calculation
         return reconstruction, z_mean, z_log_var, x
 
-    def fit(self, data, learning_rate=1e-3):
+    def fit(self, data, learning_rate=1e-3, ae_epochs=20):
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         dataloader = DataLoader(data, batch_size=self.batch_size, shuffle=True)
         self.to(('cuda' if torch.cuda.is_available() else 'cpu'))
         self.train()
-        for epoch in range(self.epochs):
+        for epoch in range(ae_epochs):
             total_loss = 0
             for batch_idx, x in enumerate(dataloader):
-
                 x = torch.Tensor(x).to('cuda' if torch.cuda.is_available() else 'cpu')
 
                 optimizer.zero_grad()
@@ -149,7 +152,6 @@ class VariationalAutoencoder(nn.Module):
             z_log_var = self.z_log_var(hidden)
             z = self.sampling(z_mean, z_log_var)
         return z
-
 
 
 class Autoencoder(nn.Module):
@@ -177,12 +179,12 @@ class Autoencoder(nn.Module):
         decoded = torch.sigmoid(self.decoder_output(encoded))
         return decoded
 
-    def fit(self, data, learning_rate=1e-3):
+    def fit(self, data, learning_rate=1e-3, ae_epochs=20):
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         dataloader = DataLoader(data, batch_size=self.batch_size, shuffle=True)
 
         self.train()
-        for epoch in range(self.epochs):
+        for epoch in range(ae_epochs):
             total_loss = 0
             for batch_idx, x in enumerate(dataloader):
                 x = x.float()
@@ -229,9 +231,11 @@ class GatedLinearUnit(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, units=None, return_attention=False, is_residual=True, activation=None, kernel_initializer=None,
+    def __init__(self, units=None, return_attention=False, is_residual=True, activation=None,
                  use_bias=True, dropout_rate=0.0):
         super(SelfAttention, self).__init__()
+        # Automatically determine the device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.units = units
         self.return_attention = return_attention
@@ -247,22 +251,25 @@ class SelfAttention(nn.Module):
         self.o_dense = None
         self.glu = None
         self.layernorm = None
-        self.dropout = Dropout(dropout_rate) if dropout_rate > 0 else None
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
 
     def build(self, input_shape):
         feature_dim = input_shape[-1]
         units = feature_dim if self.units is None else self.units
 
-        self.q_dense = nn.Linear(feature_dim, units, bias=self.use_bias)
-        self.k_dense = nn.Linear(feature_dim, units, bias=self.use_bias)
-        self.v_dense = nn.Linear(feature_dim, units, bias=self.use_bias)
-        self.o_dense = nn.Linear(units, feature_dim, bias=self.use_bias)
+        # Initialize layers and move them to the appropriate device
+        self.q_dense = nn.Linear(feature_dim, units, bias=self.use_bias).to(self.device)
+        self.k_dense = nn.Linear(feature_dim, units, bias=self.use_bias).to(self.device)
+        self.v_dense = nn.Linear(feature_dim, units, bias=self.use_bias).to(self.device)
+        self.o_dense = nn.Linear(units, feature_dim, bias=self.use_bias).to(self.device)
 
         if self.is_residual:
-            self.glu = GatedLinearUnit(feature_dim)  # GatedLinearUnit assumed to be defined earlier
-            self.layernorm = LayerNorm(feature_dim)
+            self.glu = GatedLinearUnit(feature_dim).to(self.device)  # Assuming GatedLinearUnit is defined
+            self.layernorm = nn.LayerNorm(feature_dim).to(self.device)
 
     def forward(self, x, mask=None):
+        x = x.to(self.device)  # Ensure input tensor is on the right device
+
         if self.q_dense is None:
             self.build(x.shape)
 
@@ -275,6 +282,7 @@ class SelfAttention(nn.Module):
         qk /= scale
 
         if mask is not None:
+            mask = mask.to(self.device)  # Ensure mask is on the right device
             qk = qk.masked_fill(mask == 0, float('-inf'))
 
         a = F.softmax(qk, dim=-1)
@@ -286,14 +294,13 @@ class SelfAttention(nn.Module):
         out = self.o_dense(out)
 
         if self.is_residual:
-            out += self.glu(q)  # Assuming GatedLinearUnit modifies q appropriately
+            out += self.glu(q)
             out = self.layernorm(out)
 
         if self.return_attention:
             return out, a
 
         return out
-
 
 
 class AGN(nn.Module):
@@ -306,7 +313,8 @@ class AGN(nn.Module):
         self.valve_transform = nn.Linear(feature_size, feature_size, bias=False)
         self.sigmoid = nn.Sigmoid()
         self.dropout = nn.Dropout(dropout_rate)
-        self.attn = SelfAttention(feature_size, return_attention=True, activation=self.activation, dropout_rate=dropout_rate)
+        self.attn = SelfAttention(feature_size, return_attention=True, activation=self.activation,
+                                  dropout_rate=dropout_rate)
 
     def forward(self, X, gi):
         valve = self.sigmoid(self.valve_transform(X))
@@ -325,16 +333,18 @@ class AGN(nn.Module):
 class AGNModel(nn.Module):
     def __init__(self, config, task='clf'):
         super(AGNModel, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = config
         self.task = task
-        self.bert_model = BertModel.from_pretrained(config['pretrained_model_dir'])
-
+        self.bert_model = BertModel.from_pretrained(config['pretrained_model_dir']).to(self.device)
+        self.use_agn = config.get('use_agn', True)
         self.feature_size = self.bert_model.config.hidden_size
         self.agn = AGN(self.feature_size, activation='swish', dropout_rate=config.get('dropout_rate', 0.1),
-                       valve_rate=config.get('valve_rate', 0.3), dynamic_valve=config.get('use_dynamic_valve', False))
-        self.gi_dense = nn.Linear(config["ae_latent_dim"], self.feature_size)
-        self.gi_dropout = nn.Dropout(config.get('dropout_rate', 0.1))
-        self.register_buffer("gi", torch.zeros(1, 1, self.feature_size))
+                       valve_rate=config.get('valve_rate', 0.3),
+                       dynamic_valve=config.get('use_dynamic_valve', False)).to(self.device)
+        self.gi_dense = nn.Linear(config["ae_latent_dim"], self.feature_size).to(self.device)
+        self.gi_dropout = nn.Dropout(config.get('dropout_rate', 0.1)).to(self.device)
+        self.register_buffer("gi", torch.zeros(1, 1, self.feature_size).to(self.device))
 
         if self.task == 'clf':
             self.output_layer = nn.Sequential(
@@ -343,15 +353,19 @@ class AGNModel(nn.Module):
                 nn.Dropout(config.get('dropout_rate', 0.1)),
                 nn.Linear(config.get('hidden_size', 256), config['output_size']),
                 nn.Softmax(dim=-1)
-            )
+            ).to(self.device)
         elif self.task == 'ner':
-            self.output_layer = nn.Linear(self.feature_size, config['output_size'])
+            self.output_layer = nn.Linear(self.feature_size, config['output_size']).to(self.device)
+            self.crf = CRF(config['output_size'], batch_first=True).to(self.device)
         elif self.task == 'sts':
+            # No additional settings needed for STS
             pass
 
-    def forward(self, inputs):
-        input_ids, token_type_ids, _ = inputs
-        attention_mask = (input_ids != 0).long()
+    def forward(self, input_ids, token_type_ids, tfidf_vec):
+
+        input_ids = input_ids.to(self.device)
+        token_type_ids = token_type_ids.to(self.device)
+        attention_mask = (input_ids != 0).long().to(self.device)
 
         outputs = self.bert_model(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
         sequence_output = outputs.last_hidden_state
@@ -360,26 +374,27 @@ class AGNModel(nn.Module):
         agn_output, attn_weights = self.agn(sequence_output, self.gi)
 
         if self.task == 'clf':
-            # Apply global max pooling for classification tasks
             pooled_output = torch.max(agn_output, dim=1)[0]
-            output = self.output_layer(pooled_output)
-        elif self.task in ['ner', 'sts']:
-            # Directly use the sequence output for NER or STS tasks
-            output = self.output_layer(agn_output)
+            return self.output_layer(pooled_output), attn_weights
+        elif self.task == 'ner':
+            if self.use_agn:
+                # print("Using AGN enhanced features.")
+                output_features, attn_weights = self.agn(sequence_output, self.gi)
+            else:
+                # print("Using direct BERT features.")
+                output_features = sequence_output
+                attn_weights = None  # N
+            emissions = self.output_layer(output_features)
+            return emissions, attn_weights
+            # o attention weights in this case
+        elif self.task == 'sts':
+            pass
 
-        return output, attn_weights
-
+        return None, None
 
     def update_gi(self, new_gi=None):
-        # Update the `gi` buffer based on new_gi or some internal logic
         if new_gi is not None:
+            new_gi = new_gi.to(self.device)
             processed_gi = self.gi_dense(new_gi)
             processed_gi = self.gi_dropout(processed_gi)
             self.gi = processed_gi.unsqueeze(1)  # Ensure gi is correctly shaped
-
-    def configure_optimizers(self):
-        if self.config['optimizer'] == 'adamw':
-            optimizer = optim.AdamW(self.parameters(), lr=self.config['learning_rate'])
-        else:
-            optimizer = optim.Adam(self.parameters(), lr=self.config['learning_rate'])
-        return optimizer
