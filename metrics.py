@@ -8,6 +8,8 @@ from collections import defaultdict
 from sklearn.metrics import classification_report, f1_score
 from itertools import chain
 
+from tqdm import tqdm
+
 
 class ClfMetrics(torch.nn.Module):
     def __init__(self, model, eval_loader, save_path, min_delta=1e-4, patience=10):
@@ -108,20 +110,38 @@ class NERMetrics(torch.nn.Module):
         with torch.no_grad():
             for data in self.eval_loader:
                 token_ids, segment_ids, tfidf_vectors, true_labels = data
-                emissions = self.model(token_ids, segment_ids, tfidf_vectors)
-                preds = self.model.crf.decode(emissions)  # Using CRF to decode
-                for i, length in enumerate((token_ids != 0).sum(1)):
-                    y_true.extend(true_labels[i][:length].tolist())
-                    y_pred.extend(preds[i][:length])  # preds are already decoded using CRF
+                emissions, _ = self.model(token_ids, segment_ids, tfidf_vectors)
 
-        print(classification_report(list(chain(*y_true)), list(chain(*y_pred))))
-        f1 = f1_score(list(chain(*y_true)), list(chain(*y_pred)), average="micro")
-        return f1
+                preds = self.model.crf.decode(emissions)  # 使用 CRF 解码
+
+                # 遍历批次中的每个样本
+                for i, length in enumerate((token_ids != 0).sum(1)):
+                    # 截取到实际序列长度的标签
+                    true_labels_seq = true_labels[i][:length].tolist()
+                    pred_labels_seq = preds[i][:length]
+                    # print(f"Adding true labels sequence: {true_labels_seq}")  # 调试输出
+                    # print(f"Adding predicted labels sequence: {pred_labels_seq}")  # 调试输出
+                    y_true.append(true_labels_seq)  # 添加整个序列
+                    y_pred.append(pred_labels_seq)  # 添加整个序列
+
+        # 展平 y_true 和 y_pred 列表
+        y_true_flat = [label for sublist in y_true for label in sublist]
+        y_pred_flat = [label for sublist in y_pred for label in sublist]
+
+        # 输出分类报告
+        c_r = classification_report(y_true_flat, y_pred_flat, zero_division=0)
+        print(c_r)
+        # 计算并返回 F1 得分
+        f1 = f1_score(y_true_flat, y_pred_flat, average="micro", zero_division=0)
+        return f1, c_r
 
     def on_epoch_end(self, epoch):
-        val_f1 = self.calc_metrics()
+        val_f1, c_r = self.calc_metrics()
         self.history['val_f1'].append(val_f1)
+        self.history['c_r'].append(c_r)
+
         print(f"- val_f1: {val_f1}")
+
         if self.monitor_op(val_f1 - self.min_delta, self.best):
             self.best = val_f1
             self.wait = 0
@@ -140,4 +160,44 @@ class NERMetrics(torch.nn.Module):
 
     def should_stop(self):
         return self.stop_training
+
+
+class NERTestMetrics(torch.nn.Module):
+    def __init__(self, model, eval_loader):
+        super(NERTestMetrics, self).__init__()
+        self.model = model
+        self.eval_loader = eval_loader
+        self.history = defaultdict(list)
+
+    def calc_metrics(self):
+        self.model.eval()
+        y_true, y_pred = [], []
+        with torch.no_grad():
+            for data in tqdm(self.eval_loader):
+                token_ids, segment_ids, tfidf_vectors, true_labels = data
+                emissions, _ = self.model(token_ids, segment_ids, tfidf_vectors)
+                preds = self.model.crf.decode(emissions)  # 使用 CRF 解码
+
+                for i, length in enumerate((token_ids != 0).sum(1)):
+                    true_labels_seq = true_labels[i][:length].tolist()
+                    pred_labels_seq = preds[i][:length]
+                    y_true.append(true_labels_seq)
+                    y_pred.append(pred_labels_seq)
+
+        y_true_flat = [label for sublist in y_true for label in sublist]
+        y_pred_flat = [label for sublist in y_pred for label in sublist]
+
+        c_r = classification_report(y_true_flat, y_pred_flat, zero_division=0)
+        print(c_r)
+
+        f1 = f1_score(y_true_flat, y_pred_flat, average="micro")
+        return f1, c_r
+
+    def evaluate(self):
+        test_f1, c_r = self.calc_metrics()
+        self.history['test_f1'].append(test_f1)
+        self.history['c_r'].append(c_r)
+
+        print(f"Test set Micro F1: {test_f1:.4f}")
+        return test_f1, c_r
 

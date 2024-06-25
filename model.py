@@ -9,6 +9,9 @@ from torch.nn import LayerNorm, Dropout
 from transformers import BertModel, BertConfig
 
 from torchcrf import CRF
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning, module='torchcrf')
 
 
 class Swish(nn.Module):
@@ -231,47 +234,31 @@ class GatedLinearUnit(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, units=None, return_attention=False, is_residual=True, activation=None,
+    def __init__(self, feature_size, return_attention=False, is_residual=True, activation=None,
                  use_bias=True, dropout_rate=0.0):
         super(SelfAttention, self).__init__()
-        # Automatically determine the device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.units = units
         self.return_attention = return_attention
         self.is_residual = is_residual
         self.activation = activation if activation is not None else torch.relu
         self.use_bias = use_bias
         self.dropout_rate = dropout_rate
-
-        # Initialize dense layers later in build method
-        self.q_dense = None
-        self.k_dense = None
-        self.v_dense = None
-        self.o_dense = None
-        self.glu = None
-        self.layernorm = None
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
 
-    def build(self, input_shape):
-        feature_dim = input_shape[-1]
-        units = feature_dim if self.units is None else self.units
+        # Automatically determine the device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Initialize layers and move them to the appropriate device
-        self.q_dense = nn.Linear(feature_dim, units, bias=self.use_bias).to(self.device)
-        self.k_dense = nn.Linear(feature_dim, units, bias=self.use_bias).to(self.device)
-        self.v_dense = nn.Linear(feature_dim, units, bias=self.use_bias).to(self.device)
-        self.o_dense = nn.Linear(units, feature_dim, bias=self.use_bias).to(self.device)
+        # Initialize layers immediately
+        self.q_dense = nn.Linear(feature_size, feature_size, bias=use_bias).to(self.device)
+        self.k_dense = nn.Linear(feature_size, feature_size, bias=use_bias).to(self.device)
+        self.v_dense = nn.Linear(feature_size, feature_size, bias=use_bias).to(self.device)
+        self.o_dense = nn.Linear(feature_size, feature_size, bias=use_bias).to(self.device)
 
         if self.is_residual:
-            self.glu = GatedLinearUnit(feature_dim).to(self.device)  # Assuming GatedLinearUnit is defined
-            self.layernorm = nn.LayerNorm(feature_dim).to(self.device)
+            self.glu = GatedLinearUnit(feature_size).to(self.device)  # Assuming GatedLinearUnit is defined
+            self.layernorm = nn.LayerNorm(feature_size).to(self.device)
 
     def forward(self, x, mask=None):
         x = x.to(self.device)  # Ensure input tensor is on the right device
-
-        if self.q_dense is None:
-            self.build(x.shape)
 
         q = self.q_dense(x)
         k = self.k_dense(x)
@@ -331,19 +318,26 @@ class AGN(nn.Module):
 
 
 class AGNModel(nn.Module):
-    def __init__(self, config, task='clf'):
+    def __init__(self, config, task=None):
         super(AGNModel, self).__init__()
+
+        if task not in ['clf', 'ner', 'sts']:
+            raise ValueError("Task must be one of 'clf', 'ner', or 'sts'.")
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = config
         self.task = task
         self.bert_model = BertModel.from_pretrained(config['pretrained_model_dir']).to(self.device)
         self.use_agn = config.get('use_agn', True)
         self.feature_size = self.bert_model.config.hidden_size
+
         self.agn = AGN(self.feature_size, activation='swish', dropout_rate=config.get('dropout_rate', 0.1),
                        valve_rate=config.get('valve_rate', 0.3),
                        dynamic_valve=config.get('use_dynamic_valve', False)).to(self.device)
+
         self.gi_dense = nn.Linear(config["ae_latent_dim"], self.feature_size).to(self.device)
         self.gi_dropout = nn.Dropout(config.get('dropout_rate', 0.1)).to(self.device)
+
         self.register_buffer("gi", torch.zeros(1, 1, self.feature_size).to(self.device))
 
         if self.task == 'clf':
