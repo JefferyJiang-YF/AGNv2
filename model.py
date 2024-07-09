@@ -297,18 +297,24 @@ class AGN(nn.Module):
         self.dropout_rate = dropout_rate
         self.valve_rate = valve_rate
         self.dynamic_valve = dynamic_valve
+
         self.valve_transform = nn.Linear(feature_size, feature_size, bias=False)
         self.sigmoid = nn.Sigmoid()
+
         self.dropout = nn.Dropout(dropout_rate)
         self.attn = SelfAttention(feature_size, return_attention=True, activation=self.activation,
                                   dropout_rate=dropout_rate)
 
     def forward(self, X, gi):
+
         valve = self.sigmoid(self.valve_transform(X))
+
         if self.dynamic_valve:
             valve = nn.Dropout(1.0 - self.valve_rate)(valve)
         else:
+            # 这段代码实际上定义了一个位于 0.5 附近、宽度为 2 * valve_rate 的区间。如果 valve 的值落在这个区间内，掩码的相应位置为 True（或 1），否则为 False（或 0）。
             valve_mask = (valve > 0.5 - self.valve_rate) & (valve < 0.5 + self.valve_rate)
+            # valve = valve * valve_mask.float()。这样，只有那些值处于定义的区间内的阀门元素会保留，其余的则被置为 0。
             valve = valve * valve_mask.float()
 
         enhanced = X + valve * gi

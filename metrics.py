@@ -200,4 +200,3 @@ class NERTestMetrics(torch.nn.Module):
 
         print(f"Test set Micro F1: {test_f1:.4f}")
         return test_f1, c_r
-
